@@ -64,6 +64,7 @@
     <button id="btn-playstop" disabled>Play</button>
     <button id="btn-playpause" disabled>Play</button>
     <span id="status">Loading score engine…</span>
+    <span id="version" style="color:#999;font-size:0.8rem">v3 · piano</span>
     <a href="../">← Home</a>
   </header>
   <main>
@@ -116,11 +117,10 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       try { navigator.audioSession.type = 'playback'; } catch (e) {}
     }
 
-    // Older iOS (< 17) has no audioSession API. Playing an <audio> element
-    // switches the page into the same "playback" category, so we loop a
-    // tiny silent clip while the music is playing.
+    // Belt and braces (and the only fix on iOS < 17): a playing <audio>
+    // element also switches the page into the "playback" category, so we
+    // loop a tiny silent clip while the music is playing.
     const silentAudio = (() => {
-      if (navigator.audioSession) return null;
       const rate = 8000, len = rate / 2;
       const buf = new ArrayBuffer(44 + len);
       const v = new DataView(buf);
@@ -242,13 +242,15 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       const a = onsets[i];
       const b = onsets[i + 1];
       let x;
-      if (b && b.system === a.system) {
+      // Glide only between two notes on the same line, moving forward.
+      // On the last note of a line the marker stays put, then jumps
+      // straight to the first note of the next line.
+      const sameLine = b && Math.abs(b.top - a.top) < 2 && b.x > a.x;
+      if (sameLine) {
         const f = Math.min(1, Math.max(0, (t - a.t) / (b.t - a.t)));
         x = a.x + (b.x - a.x) * f;
       } else {
-        const endT = b ? b.t : totalDuration;
-        const f = Math.min(1, Math.max(0, (t - a.t) / Math.max(0.001, endT - a.t)));
-        x = a.x + (a.systemRight - a.x) * f;
+        x = a.x;
       }
       cursorEl.style.display = 'block';
       cursorEl.style.left = (x - 1) + 'px';
