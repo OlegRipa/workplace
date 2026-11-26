@@ -58,6 +58,7 @@
       display: none;
       /* Own GPU layer: moving it never repaints the score. */
       will-change: transform;
+      transform-origin: 0 0;
     }
     #score g.note.playing, #score g.note.playing * { fill: var(--accent); stroke: var(--accent); }
   </style>
@@ -68,7 +69,7 @@
     <button id="btn-playstop" disabled>Play</button>
     <button id="btn-playpause" disabled>Play</button>
     <span id="status">Loading score engine…</span>
-    <span id="version" style="color:#999;font-size:0.8rem">v5 · piano</span>
+    <span id="version" style="color:#999;font-size:0.8rem">v6 · piano</span>
     <a href="../">← Home</a>
   </header>
   <main>
@@ -113,7 +114,6 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
     let ctxStartTime = 0;      // audioCtx.currentTime corresponding to `offset`
     let activeNodes = [];
     let rafId = null;
-    let endTimer = null;
 
     let masterGain = null;
 
@@ -183,8 +183,8 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       for (let p = 1; p <= tk.getPageCount(); p++) svg += tk.renderToSVG(p);
       scoreEl.innerHTML = svg;
       computeOnsetPositions();
-      lastSystem = null;  // re-size the marker for the new layout
-      if (state !== 'stopped') updateCursor(state === 'playing' ? visualPosition(performance.now()) : offset);
+      lastSystem = null;
+      buildMarkerAnimation();
     }
 
     function buildTiming() {
@@ -236,6 +236,14 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
     }
 
     // ---------- Cursor ----------
+    // The marker is driven by ONE Web Animation covering the whole piece:
+    // a keyframe at every note (linear glide between them), a keyframe at
+    // each line end, and an almost-instant step to the next line. The
+    // browser's compositor runs it on its own thread, so it stays smooth on
+    // iPhone even when the page's JavaScript is busy (garbage collection,
+    // repainting a highlighted note, touch handling). JavaScript only aligns
+    // the animation's start time with the audio, and does the note colouring
+    // and scrolling, which are not frame-critical.
     function findOnsetIndex(t) {
       let lo = 0, hi = onsets.length - 1, ans = 0;
       while (lo <= hi) {
@@ -245,34 +253,67 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       return ans;
     }
 
+    let markerAnim = null;
+    let markerH = 0;
+
+    function buildMarkerAnimation() {
+      if (markerAnim) markerAnim.cancel();
+      markerAnim = null;
+      const placed = onsets.filter(o => o.x !== undefined);
+      if (!placed.length || !totalDuration) return;
+      markerH = Math.max(...placed.map(o => o.bottom - o.top));
+      cursorEl.style.height = markerH + 'px';
+      const D = totalDuration;
+      const frames = [];
+      const kf = (t, x, o) => frames.push({
+        offset: Math.min(1, Math.max(0, t / D)),
+        transform: `translate3d(${(x - 1).toFixed(2)}px, ${o.top.toFixed(2)}px, 0) scaleY(${((o.bottom - o.top) / markerH).toFixed(4)})`,
+      });
+      kf(0, placed[0].x, placed[0]);
+      for (let i = 0; i < placed.length; i++) {
+        const a = placed[i], b = placed[i + 1];
+        kf(a.t, a.x, a);
+        const sameLine = b && Math.abs(b.top - a.top) < 2 && b.x > a.x;
+        if (!sameLine) {
+          // Glide to the end of the line, then step (1 ms) to the next line.
+          const endT = b ? b.t : D;
+          kf(Math.max(a.t, endT - 0.001), Math.max(a.x, a.systemRight - 2), a);
+        }
+      }
+      const last = placed[placed.length - 1];
+      kf(D, Math.max(last.x, last.systemRight - 2), last);  // hold at the final barline
+      frames.sort((p, q) => p.offset - q.offset);
+      markerAnim = cursorEl.animate(frames, { duration: D * 1000, easing: 'linear', fill: 'both' });
+      syncMarker();
+    }
+
+    // Put the animation in the state matching the transport.
+    function syncMarker() {
+      if (!markerAnim) return;
+      if (state === 'playing') {
+        markerAnim.startTime = perfAtStart - offset * 1000;
+        if (markerAnim.playState !== 'running') markerAnim.play();
+        markerAnim.startTime = perfAtStart - offset * 1000;
+      } else {
+        markerAnim.pause();
+        markerAnim.currentTime = offset * 1000;
+      }
+      cursorEl.style.display = state === 'stopped' ? 'none' : 'block';
+    }
+
     let lastIdx = -1;
     let lastSystem = null;
-    function updateCursor(t) {
+    // Non frame-critical work: note colouring and keeping the line in view.
+    function followPosition(t) {
       if (!onsets.length) return;
       const i = findOnsetIndex(t);
       const a = onsets[i];
-      const b = onsets[i + 1];
-      let x;
-      // Glide between notes on the same line. On a line's last note, glide
-      // forward to the end of the line, then jump straight to the next line.
-      // The marker never moves backwards.
-      const sameLine = b && Math.abs(b.top - a.top) < 2 && b.x > a.x;
-      const target = sameLine ? b.x : Math.max(a.x, a.systemRight - 2);
-      const endT = b ? b.t : totalDuration;
-      const f = Math.min(1, Math.max(0, (t - a.t) / Math.max(0.001, endT - a.t)));
-      x = a.x + (target - a.x) * f;
-      // Compositor-only update: a transform, no layout or paint.
-      cursorEl.style.transform = `translate3d(${x - 1}px, ${a.top}px, 0)`;
-
       if (a.system !== lastSystem) {
-        // Only on a line change: size, show, and scroll into view.
         lastSystem = a.system;
-        cursorEl.style.height = (a.bottom - a.top) + 'px';
-        cursorEl.style.display = 'block';
-        const r = cursorEl.getBoundingClientRect();
+        const top = wrapEl.getBoundingClientRect().top + a.top;
         const headerH = headerEl.offsetHeight;
-        if (r.top < headerH || r.bottom > window.innerHeight) {
-          window.scrollBy(0, r.top - headerH - 40);  // jump, no animation
+        if (top < headerH || top + (a.bottom - a.top) > window.innerHeight) {
+          window.scrollBy(0, top - headerH - 40);  // jump, no animation
         }
       }
       if (i !== lastIdx) {
@@ -294,8 +335,7 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       highlighted = now;
     }
 
-    function clearCursor() {
-      cursorEl.style.display = 'none';
+    function clearHighlights() {
       for (const id of highlighted) noteEls.get(id)?.classList.remove('playing');
       highlighted = new Set();
       lastIdx = -1;
@@ -308,13 +348,17 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       return offset;
     }
 
-    // ---- Smooth visual clock ----
-    // audioCtx.currentTime advances in uneven steps (audio buffer sized, and
-    // coarser on phones), which makes the marker stutter. Instead we animate
-    // from the frame timestamp, anchored to the moment `ctxStartTime` is
-    // actually heard (getOutputTimestamp includes output latency, e.g.
-    // Bluetooth), and nudge that anchor gently to cancel any clock drift.
-    let perfAtStart = 0;   // performance.now() (ms) when position == offset is heard
+    // ---- Aligning the marker with the audio ----
+    // perfAtStart = performance.now() (ms) at which position `offset` is
+    // actually heard. iPhone audio clocks report time in coarse, jittery
+    // steps, so we never follow them frame by frame:
+    //  1. "Locking" (first ~0.3 s of sound): take the median of the
+    //     measurements, which throws away the jitter.
+    //  2. Then: average the error and, if it exceeds 6 ms, glide the
+    //     marker back in sync by at most 0.5 ms per frame (invisible).
+    let perfAtStart = 0;
+    let lockSamples = [];
+    let errAvg = 0;
 
     function measureAnchor() {
       const ts = audioCtx.getOutputTimestamp ? audioCtx.getOutputTimestamp() : null;
@@ -329,16 +373,35 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       return Math.max(offset, offset + (now - perfAtStart) / 1000);
     }
 
+    function setAnchor(v) {
+      perfAtStart = v;
+      if (markerAnim) markerAnim.startTime = perfAtStart - offset * 1000;
+    }
+
     function tick(now) {
-      if (audioCtx.state === 'running') {
-        const fresh = measureAnchor();
-        const diff = fresh - perfAtStart;
-        // Big gap (e.g. audio just resumed): snap. Small jitter: smooth it out.
-        perfAtStart += Math.abs(diff) > 40 ? diff : diff * 0.03;
+      if (audioCtx.state !== 'running') {
+        // Audio not started yet (phone waiting for the finger to lift):
+        // hold the marker on the start position until sound begins.
+        lockSamples = [];
+        setAnchor(now + 16 + (ctxStartTime - audioCtx.currentTime) * 1000);
+      } else if (lockSamples.length < 20) {
+        lockSamples.push(measureAnchor());
+        const sorted = [...lockSamples].sort((p, q) => p - q);
+        const med = sorted[sorted.length >> 1];
+        if (Math.abs(med - perfAtStart) > 1) setAnchor(med);
       } else {
-        perfAtStart = now + (ctxStartTime - audioCtx.currentTime) * 1000;
+        // Averaged error; if it exceeds 6 ms, slew towards it by at most
+        // 0.5 ms per frame (invisible) instead of jumping.
+        errAvg += (measureAnchor() - perfAtStart - errAvg) * 0.02;
+        if (Math.abs(errAvg) > 6) {
+          const step = Math.max(-0.5, Math.min(0.5, errAvg));
+          setAnchor(perfAtStart + step);
+          errAvg -= step;
+        }
       }
-      updateCursor(visualPosition(now));
+      const t = visualPosition(now);
+      if (t >= totalDuration + 0.15) { stop(); return; }
+      followPosition(t);
       rafId = requestAnimationFrame(tick);
     }
 
@@ -404,6 +467,8 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       // Start almost immediately; a tiny lead keeps the first attack click-free.
       ctxStartTime = audioCtx.currentTime + 0.01;
       perfAtStart = measureAnchor();
+      lockSamples = [];
+      errAvg = 0;
       for (const n of notes) {
         if (n.end <= offset) continue;
         const start = Math.max(n.start, offset);
@@ -412,8 +477,7 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       }
       state = 'playing';
       if (silentAudio) silentAudio.play().catch(() => {});
-      clearTimeout(endTimer);
-      endTimer = setTimeout(stop, (totalDuration - offset) * 1000 + 150);
+      syncMarker();
       cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(tick);
       updateButtons();
@@ -424,20 +488,20 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       // Pause where the listener is (what's heard / where the marker is).
       offset = Math.min(currentPosition(), visualPosition(performance.now()));
       stopAllNodes();
-      clearTimeout(endTimer);
       cancelAnimationFrame(rafId);
       state = 'paused';
-      updateCursor(offset);
+      syncMarker();
+      followPosition(offset);
       updateButtons();
     }
 
     function stop() {
       stopAllNodes();
-      clearTimeout(endTimer);
       cancelAnimationFrame(rafId);
       state = 'stopped';
       offset = 0;
-      clearCursor();
+      syncMarker();
+      clearHighlights();
       updateButtons();
     }
 
@@ -477,6 +541,7 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       render();
       buildTiming();
       computeOnsetPositions();
+      buildMarkerAnimation();
       statusEl.textContent = 'Loading piano…';
       loadSamplesForScore().then(() => {
         btnPlayStop.disabled = false;
