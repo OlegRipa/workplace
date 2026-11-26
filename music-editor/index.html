@@ -69,7 +69,7 @@
     <button id="btn-playstop" disabled>Play</button>
     <button id="btn-playpause" disabled>Play</button>
     <span id="status">Loading score engine…</span>
-    <span id="version" style="color:#999;font-size:0.8rem">v6 · piano</span>
+    <span id="version" style="color:#999;font-size:0.8rem">v7 · piano</span>
     <a href="../">← Home</a>
   </header>
   <main>
@@ -253,21 +253,38 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       return ans;
     }
 
-    let markerAnim = null;
+    let markerAnim = null;   // exists only while playing
+    let markerFrames = [];   // { t (s), x, y, s (scaleY) }
     let markerH = 0;
 
+    const markerTransform = f =>
+      `translate3d(${(f.x - 1).toFixed(2)}px, ${f.y.toFixed(2)}px, 0) scaleY(${f.s.toFixed(4)})`;
+
+    // Marker position at time t, computed directly (used while paused).
+    function markerFrameAt(t) {
+      const F = markerFrames;
+      if (t <= F[0].t) return F[0];
+      for (let i = 1; i < F.length; i++) {
+        if (F[i].t >= t) {
+          const a = F[i - 1], b = F[i];
+          if (a.y !== b.y) return t < b.t ? a : b;  // line change: hold, then jump
+          const f = b.t > a.t ? (t - a.t) / (b.t - a.t) : 1;
+          return { t, x: a.x + (b.x - a.x) * f, y: a.y, s: a.s };
+        }
+      }
+      return F[F.length - 1];
+    }
+
     function buildMarkerAnimation() {
-      if (markerAnim) markerAnim.cancel();
-      markerAnim = null;
+      markerFrames = [];
       const placed = onsets.filter(o => o.x !== undefined);
       if (!placed.length || !totalDuration) return;
       markerH = Math.max(...placed.map(o => o.bottom - o.top));
       cursorEl.style.height = markerH + 'px';
       const D = totalDuration;
-      const frames = [];
+      const frames = markerFrames;
       const kf = (t, x, o) => frames.push({
-        offset: Math.min(1, Math.max(0, t / D)),
-        transform: `translate3d(${(x - 1).toFixed(2)}px, ${o.top.toFixed(2)}px, 0) scaleY(${((o.bottom - o.top) / markerH).toFixed(4)})`,
+        t: Math.min(D, Math.max(0, t)), x, y: o.top, s: (o.bottom - o.top) / markerH,
       });
       kf(0, placed[0].x, placed[0]);
       for (let i = 0; i < placed.length; i++) {
@@ -282,23 +299,37 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       }
       const last = placed[placed.length - 1];
       kf(D, Math.max(last.x, last.systemRight - 2), last);  // hold at the final barline
-      frames.sort((p, q) => p.offset - q.offset);
-      markerAnim = cursorEl.animate(frames, { duration: D * 1000, easing: 'linear', fill: 'both' });
+      frames.sort((p, q) => p.t - q.t);
       syncMarker();
     }
 
-    // Put the animation in the state matching the transport.
+    // Put the marker in the state matching the transport.
+    // Safari does not reliably restart a paused Web Animation, so we never
+    // pause one: playing = a brand-new running animation; paused = a plain
+    // static transform; stopped = hidden.
     function syncMarker() {
-      if (!markerAnim) return;
-      if (state === 'playing') {
-        markerAnim.startTime = perfAtStart - offset * 1000;
-        if (markerAnim.playState !== 'running') markerAnim.play();
-        markerAnim.startTime = perfAtStart - offset * 1000;
-      } else {
-        markerAnim.pause();
-        markerAnim.currentTime = offset * 1000;
+      if (markerAnim) { markerAnim.cancel(); markerAnim = null; }
+      if (state === 'stopped' || !markerFrames.length) {
+        cursorEl.style.display = 'none';
+        return;
       }
-      cursorEl.style.display = state === 'stopped' ? 'none' : 'block';
+      cursorEl.style.transform = markerTransform(markerFrameAt(offset));
+      cursorEl.style.display = 'block';
+      if (state === 'playing') {
+        const D = totalDuration;
+        markerAnim = cursorEl.animate(
+          markerFrames.map(f => ({ offset: f.t / D, transform: markerTransform(f) })),
+          { duration: D * 1000, easing: 'linear', fill: 'both' });
+        alignMarker();
+      }
+    }
+
+    // Set the running animation's position from the audio anchor. Uses
+    // currentTime (works everywhere) rather than startTime.
+    function alignMarker() {
+      if (!markerAnim) return;
+      const nowMs = document.timeline.currentTime ?? performance.now();
+      markerAnim.currentTime = Math.max(offset * 1000, nowMs - perfAtStart + offset * 1000);
     }
 
     let lastIdx = -1;
@@ -375,7 +406,7 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
 
     function setAnchor(v) {
       perfAtStart = v;
-      if (markerAnim) markerAnim.startTime = perfAtStart - offset * 1000;
+      alignMarker();
     }
 
     function tick(now) {
@@ -401,6 +432,11 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       }
       const t = visualPosition(now);
       if (t >= totalDuration + 0.15) { stop(); return; }
+      // A new animation starts one frame late; keep it on the clock.
+      if (markerAnim && markerAnim.currentTime !== null &&
+          Math.abs(markerAnim.currentTime - t * 1000) > 2) {
+        markerAnim.currentTime = t * 1000;
+      }
       followPosition(t);
       rafId = requestAnimationFrame(tick);
     }
