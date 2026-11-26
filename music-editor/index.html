@@ -108,7 +108,7 @@
     <button id="btn-playstop" disabled>Play</button>
     <button id="btn-playpause" disabled>Play</button>
     <span id="status">Loading score engine…</span>
-    <span id="version">v9 · piano</span>
+    <span id="version">v10 · piano</span>
     <a href="../">← Home</a>
     <button id="btn-theme" type="button" aria-label="Switch theme"></button>
   </header>
@@ -402,7 +402,7 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       }
       cursorEl.style.transform = markerTransform(markerFrameAt(offset));
       cursorEl.style.display = 'block';
-      if (state === 'playing') {
+      if (state === 'playing' && markerLive) {
         const D = totalDuration;
         markerAnim = cursorEl.animate(
           markerFrames.map(f => ({ offset: f.t / D, transform: markerTransform(f) })),
@@ -475,6 +475,7 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
     //  2. Then: average the error and, if it exceeds 6 ms, glide the
     //     marker back in sync by at most 0.5 ms per frame (invisible).
     let perfAtStart = 0;
+    let markerLive = false;   // true once the audio has actually started
     let lastCtxTime = -1;
     let stuckSince = 0;
     let lockSamples = [];
@@ -482,14 +483,18 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
 
     function measureAnchor() {
       const ts = audioCtx.getOutputTimestamp ? audioCtx.getOutputTimestamp() : null;
-      if (ts && ts.performanceTime > 0 && ts.contextTime > 0) {
-        return ts.performanceTime + (ctxStartTime - ts.contextTime) * 1000;
-      }
       const latency = (audioCtx.outputLatency || audioCtx.baseLatency || 0) * 1000;
-      return performance.now() + (ctxStartTime - audioCtx.currentTime) * 1000 + latency;
+      const fallback = performance.now() + (ctxStartTime - audioCtx.currentTime) * 1000 + latency;
+      if (ts && ts.performanceTime > 0 && ts.contextTime > 0) {
+        const precise = ts.performanceTime + (ctxStartTime - ts.contextTime) * 1000;
+        // A fresh context can report a stale timestamp; only trust a sane one.
+        if (Math.abs(precise - fallback) < 250) return precise;
+      }
+      return fallback;
     }
 
     function visualPosition(now) {
+      if (state === 'playing' && !markerLive) return offset;
       return Math.max(offset, offset + (now - perfAtStart) / 1000);
     }
 
@@ -514,11 +519,18 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
         statusEl.textContent = 'Audio was asleep — tap Play again';
         return;
       }
-      if (audioCtx.state !== 'running') {
-        // Audio not started yet (phone waiting for the finger to lift):
-        // hold the marker on the start position until sound begins.
-        lockSamples = [];
-        setAnchor(now + 16 + (ctxStartTime - audioCtx.currentTime) * 1000);
+      if (!markerLive) {
+        // Hold the marker still until the audio is really playing: the
+        // context is running AND its clock has reached the first note.
+        // A freshly created context (after sleep) can take a while to
+        // start; moving early would make the marker run ahead and snap back.
+        if (audioCtx.state === 'running' && ctxNow >= ctxStartTime) {
+          markerLive = true;
+          perfAtStart = measureAnchor();
+          lockSamples = [];
+          errAvg = 0;
+          syncMarker();
+        }
       } else if (lockSamples.length < 20) {
         lockSamples.push(measureAnchor());
         const sorted = [...lockSamples].sort((p, q) => p - q);
@@ -604,6 +616,7 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       unlockAudio();
       // Start almost immediately; a tiny lead keeps the first attack click-free.
       ctxStartTime = audioCtx.currentTime + 0.01;
+      markerLive = false;
       perfAtStart = measureAnchor();
       lockSamples = [];
       errAvg = 0;
