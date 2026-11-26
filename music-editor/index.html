@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Music Editor</title>
+  <style>
+    :root { --accent: #d93025; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #f5f5f5;
+      color: #222;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding: 12px 16px;
+      background: #fff;
+      border-bottom: 1px solid #ddd;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    header h1 { font-size: 1.2rem; margin: 0 12px 0 0; }
+    header a { color: #555; font-size: 0.9rem; }
+    button {
+      font: inherit;
+      padding: 8px 16px;
+      min-width: 96px;
+      border: 1px solid #bbb;
+      border-radius: 6px;
+      background: #fff;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: #eee; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    #status { color: #666; font-size: 0.9rem; }
+    main { padding: 16px; }
+    #score-wrap {
+      position: relative;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 8px;
+      overflow: hidden;
+    }
+    #score svg { display: block; }
+    #cursor {
+      position: absolute;
+      width: 2px;
+      background: var(--accent);
+      pointer-events: none;
+      display: none;
+    }
+    #score g.note.playing, #score g.note.playing * { fill: var(--accent); stroke: var(--accent); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Music Editor</h1>
+    <button id="btn-playstop" disabled>Play</button>
+    <button id="btn-playpause" disabled>Play</button>
+    <span id="status">Loading score engine…</span>
+    <a href="../">← Home</a>
+  </header>
+  <main>
+    <div id="score-wrap">
+      <div id="score"></div>
+      <div id="cursor"></div>
+    </div>
+  </main>
+
+  <script>
+    // Sample music (Beethoven, "Ode to Joy" — public domain), in ABC notation.
+    const SAMPLE_ABC = `X:1
+T:Ode to Joy
+C:Ludwig van Beethoven
+M:4/4
+L:1/4
+Q:1/4=120
+K:D
+|F F G A|A G F E|D D E F|F3/2 E/ E2|
+F F G A|A G F E|D D E F|E3/2 D/ D2|
+E E F D|E F/G/ F D|E F/G/ F E|D E A,2|
+F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
+
+    const scoreEl = document.getElementById('score');
+    const wrapEl = document.getElementById('score-wrap');
+    const cursorEl = document.getElementById('cursor');
+    const btnPlayStop = document.getElementById('btn-playstop');
+    const btnPlayPause = document.getElementById('btn-playpause');
+    const statusEl = document.getElementById('status');
+
+    let tk = null;
+    let notes = [];     // { id, start, end, pitch } — times in seconds
+    let onsets = [];    // { t, ids, x, top, bottom, systemRight } sorted by t
+    let totalDuration = 0;
+
+    // ---------- Playback state ----------
+    let audioCtx = null;
+    let state = 'stopped';     // 'stopped' | 'playing' | 'paused'
+    let offset = 0;            // position in seconds where playback (re)starts
+    let ctxStartTime = 0;      // audioCtx.currentTime corresponding to `offset`
+    let activeNodes = [];
+    let rafId = null;
+    let endTimer = null;
+
+    // Create/resume the AudioContext on the very first user interaction so
+    // that it is already running when Play is clicked (minimal start latency).
+    function ensureAudio() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+      }
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      return audioCtx;
+    }
+    window.addEventListener('pointerdown', ensureAudio, { once: true, capture: true });
+    window.addEventListener('keydown', ensureAudio, { once: true, capture: true });
+
+    // ---------- Rendering ----------
+    function render() {
+      const width = Math.max(300, wrapEl.clientWidth - 16);
+      const scale = width < 600 ? 30 : 40;
+      tk.setOptions({
+        scale,
+        pageWidth: Math.round(width * 100 / scale),
+        pageMarginLeft: 20, pageMarginRight: 20, pageMarginTop: 20, pageMarginBottom: 20,
+        adjustPageHeight: true,
+        breaks: 'auto',
+        footer: 'none',
+      });
+      tk.redoLayout();
+      let svg = '';
+      for (let p = 1; p <= tk.getPageCount(); p++) svg += tk.renderToSVG(p);
+      scoreEl.innerHTML = svg;
+      computeOnsetPositions();
+      if (state !== 'stopped') updateCursor(currentPosition());
+    }
+
+    function buildTiming() {
+      const timemap = tk.renderToTimemap();
+      const starts = {};
+      notes = [];
+      onsets = [];
+      for (const e of timemap) {
+        const t = e.tstamp / 1000;
+        if (e.on && e.on.length) {
+          for (const id of e.on) starts[id] = t;
+          onsets.push({ t, ids: e.on });
+        }
+        if (e.off) {
+          for (const id of e.off) {
+            if (starts[id] === undefined) continue;
+            const midi = tk.getMIDIValuesForElement(id);
+            notes.push({ id, start: starts[id], end: t, pitch: midi.pitch });
+          }
+        }
+        totalDuration = Math.max(totalDuration, t);
+      }
+      notes.sort((a, b) => a.start - b.start);
+    }
+
+    // Measure where each onset sits on screen (relative to #score-wrap).
+    function computeOnsetPositions() {
+      const wrapRect = wrapEl.getBoundingClientRect();
+      for (const o of onsets) {
+        const el = document.getElementById(o.ids[0]);
+        if (!el) continue;
+        const head = el.querySelector('.notehead') || el;
+        const r = head.getBoundingClientRect();
+        const system = el.closest('g.system');
+        const sr = (system || el).getBoundingClientRect();
+        // Right edge of the system's staff lines.
+        const staffLines = system && system.querySelector('g.staff > path');
+        const lr = staffLines ? staffLines.getBoundingClientRect() : sr;
+        o.system = system;
+        o.x = r.left + r.width / 2 - wrapRect.left;
+        o.top = sr.top - wrapRect.top - 6;
+        o.bottom = sr.bottom - wrapRect.top + 6;
+        o.systemRight = lr.right - wrapRect.left;
+      }
+    }
+
+    // ---------- Cursor ----------
+    function findOnsetIndex(t) {
+      let lo = 0, hi = onsets.length - 1, ans = 0;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (onsets[mid].t <= t) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      return ans;
+    }
+
+    let lastIdx = -1;
+    let lastSystem = null;
+    function updateCursor(t) {
+      if (!onsets.length) return;
+      const i = findOnsetIndex(t);
+      const a = onsets[i];
+      const b = onsets[i + 1];
+      let x;
+      if (b && b.system === a.system) {
+        const f = Math.min(1, Math.max(0, (t - a.t) / (b.t - a.t)));
+        x = a.x + (b.x - a.x) * f;
+      } else {
+        const endT = b ? b.t : totalDuration;
+        const f = Math.min(1, Math.max(0, (t - a.t) / Math.max(0.001, endT - a.t)));
+        x = a.x + (a.systemRight - a.x) * f;
+      }
+      cursorEl.style.display = 'block';
+      cursorEl.style.left = (x - 1) + 'px';
+      cursorEl.style.top = a.top + 'px';
+      cursorEl.style.height = (a.bottom - a.top) + 'px';
+
+      if (i !== lastIdx) {
+        highlight(t);
+        lastIdx = i;
+      }
+      if (a.system !== lastSystem) {
+        lastSystem = a.system;
+        const r = cursorEl.getBoundingClientRect();
+        const headerH = document.querySelector('header').offsetHeight;
+        if (r.top < headerH || r.bottom > window.innerHeight) {
+          window.scrollBy({ top: r.top - headerH - 40, behavior: 'smooth' });
+        }
+      }
+    }
+
+    function highlight(t) {
+      scoreEl.querySelectorAll('g.note.playing').forEach(n => n.classList.remove('playing'));
+      for (const n of notes) {
+        if (n.start > t) break;
+        if (n.end > t) document.getElementById(n.id)?.classList.add('playing');
+      }
+    }
+
+    function clearCursor() {
+      cursorEl.style.display = 'none';
+      scoreEl.querySelectorAll('g.note.playing').forEach(n => n.classList.remove('playing'));
+      lastIdx = -1;
+      lastSystem = null;
+    }
+
+    function currentPosition() {
+      if (state === 'playing') return offset + (audioCtx.currentTime - ctxStartTime);
+      return offset;
+    }
+
+    function tick() {
+      const t = currentPosition();
+      updateCursor(Math.max(0, t));
+      rafId = requestAnimationFrame(tick);
+    }
+
+    // ---------- Synth (Web Audio, no samples to download → instant start) ----------
+    function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+
+    function scheduleNote(freq, when, dur) {
+      const osc = audioCtx.createOscillator();
+      const osc2 = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'triangle';
+      osc2.type = 'sine';
+      osc.frequency.value = freq;
+      osc2.frequency.value = freq * 2;
+      const g2 = audioCtx.createGain();
+      g2.gain.value = 0.25;
+      osc.connect(gain);
+      osc2.connect(g2).connect(gain);
+      gain.connect(audioCtx.destination);
+      const peak = 0.3;
+      const release = 0.08;
+      const noteEnd = when + Math.max(0.05, dur - 0.02);
+      gain.gain.setValueAtTime(0, when);
+      gain.gain.linearRampToValueAtTime(peak, when + 0.008);
+      gain.gain.exponentialRampToValueAtTime(peak * 0.5, when + Math.min(0.3, dur));
+      gain.gain.setValueAtTime(peak * 0.5, noteEnd);
+      gain.gain.linearRampToValueAtTime(0, noteEnd + release);
+      osc.start(when); osc2.start(when);
+      osc.stop(noteEnd + release + 0.01); osc2.stop(noteEnd + release + 0.01);
+      activeNodes.push(osc, osc2);
+    }
+
+    function stopAllNodes() {
+      for (const n of activeNodes) { try { n.stop(); n.disconnect(); } catch (e) {} }
+      activeNodes = [];
+    }
+
+    // ---------- Transport ----------
+    function play() {
+      if (!tk || state === 'playing') return;
+      ensureAudio();
+      if (offset >= totalDuration) offset = 0;
+      // Start almost immediately; a tiny lead keeps the first attack click-free.
+      ctxStartTime = audioCtx.currentTime + 0.01;
+      for (const n of notes) {
+        if (n.end <= offset) continue;
+        const start = Math.max(n.start, offset);
+        scheduleNote(midiToFreq(n.pitch), ctxStartTime + (start - offset), n.end - start);
+      }
+      state = 'playing';
+      clearTimeout(endTimer);
+      endTimer = setTimeout(stop, (totalDuration - offset) * 1000 + 150);
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(tick);
+      updateButtons();
+    }
+
+    function pause() {
+      if (state !== 'playing') return;
+      offset = currentPosition();
+      stopAllNodes();
+      clearTimeout(endTimer);
+      cancelAnimationFrame(rafId);
+      state = 'paused';
+      updateCursor(offset);
+      updateButtons();
+    }
+
+    function stop() {
+      stopAllNodes();
+      clearTimeout(endTimer);
+      cancelAnimationFrame(rafId);
+      state = 'stopped';
+      offset = 0;
+      clearCursor();
+      updateButtons();
+    }
+
+    function updateButtons() {
+      btnPlayStop.textContent = state === 'playing' ? 'Stop' : 'Play';
+      btnPlayPause.textContent = state === 'playing' ? 'Pause' : (state === 'paused' ? 'Resume' : 'Play');
+      statusEl.textContent = state === 'playing' ? 'Playing' : (state === 'paused' ? 'Paused' : 'Ready');
+    }
+
+    // Button 1: Play / Stop (stop returns to the beginning)
+    btnPlayStop.addEventListener('pointerdown', e => { e.preventDefault(); state === 'playing' ? stop() : play(); });
+    // Button 2: Play / Pause (pause keeps the position)
+    btnPlayPause.addEventListener('pointerdown', e => { e.preventDefault(); state === 'playing' ? pause() : play(); });
+    // Keyboard access (Enter/Space) still goes through click.
+    for (const b of [btnPlayStop, btnPlayPause]) {
+      b.addEventListener('click', e => { if (e.detail === 0) b.dispatchEvent(new PointerEvent('pointerdown')); });
+    }
+    // Space bar = play/pause.
+    window.addEventListener('keydown', e => {
+      if (e.code === 'Space' && e.target === document.body) {
+        e.preventDefault();
+        state === 'playing' ? pause() : play();
+      }
+    });
+
+    let resizeTimer;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => tk && render(), 150);
+    });
+
+    // ---------- Init ----------
+    function init() {
+      tk = new verovio.toolkit();
+      tk.setOptions({ inputFrom: 'abc' });
+      tk.loadData(SAMPLE_ABC);
+      render();
+      buildTiming();
+      computeOnsetPositions();
+      btnPlayStop.disabled = false;
+      btnPlayPause.disabled = false;
+      updateButtons();
+    }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/verovio@6.3.0/dist/verovio-toolkit-wasm.js"></script>
+  <script>
+    verovio.module.onRuntimeInitialized = init;
+  </script>
+</body>
+</html>
