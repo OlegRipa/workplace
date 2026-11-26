@@ -64,7 +64,7 @@
     <button id="btn-playstop" disabled>Play</button>
     <button id="btn-playpause" disabled>Play</button>
     <span id="status">Loading score engine…</span>
-    <span id="version" style="color:#999;font-size:0.8rem">v3 · piano</span>
+    <span id="version" style="color:#999;font-size:0.8rem">v4 · piano</span>
     <a href="../">← Home</a>
   </header>
   <main>
@@ -213,9 +213,10 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
         const r = head.getBoundingClientRect();
         const system = el.closest('g.system');
         const sr = (system || el).getBoundingClientRect();
-        // Right edge of the system's staff lines.
-        const staffLines = system && system.querySelector('g.staff > path');
-        const lr = staffLines ? staffLines.getBoundingClientRect() : sr;
+        // End of the line = right edge of the line's last measure (its barline).
+        const measures = system ? system.querySelectorAll('g.measure') : [];
+        const lastMeasure = measures[measures.length - 1];
+        const lr = lastMeasure ? lastMeasure.getBoundingClientRect() : sr;
         o.system = system;
         o.x = r.left + r.width / 2 - wrapRect.left;
         o.top = sr.top - wrapRect.top - 6;
@@ -242,16 +243,14 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       const a = onsets[i];
       const b = onsets[i + 1];
       let x;
-      // Glide only between two notes on the same line, moving forward.
-      // On the last note of a line the marker stays put, then jumps
-      // straight to the first note of the next line.
+      // Glide between notes on the same line. On a line's last note, glide
+      // forward to the end of the line, then jump straight to the next line.
+      // The marker never moves backwards.
       const sameLine = b && Math.abs(b.top - a.top) < 2 && b.x > a.x;
-      if (sameLine) {
-        const f = Math.min(1, Math.max(0, (t - a.t) / (b.t - a.t)));
-        x = a.x + (b.x - a.x) * f;
-      } else {
-        x = a.x;
-      }
+      const target = sameLine ? b.x : Math.max(a.x, a.systemRight - 2);
+      const endT = b ? b.t : totalDuration;
+      const f = Math.min(1, Math.max(0, (t - a.t) / Math.max(0.001, endT - a.t)));
+      x = a.x + (target - a.x) * f;
       cursorEl.style.display = 'block';
       cursorEl.style.left = (x - 1) + 'px';
       cursorEl.style.top = a.top + 'px';
