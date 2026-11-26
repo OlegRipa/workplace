@@ -69,7 +69,7 @@
     <button id="btn-playstop" disabled>Play</button>
     <button id="btn-playpause" disabled>Play</button>
     <span id="status">Loading score engine…</span>
-    <span id="version" style="color:#999;font-size:0.8rem">v7 · piano</span>
+    <span id="version" style="color:#999;font-size:0.8rem">v8 · piano</span>
     <a href="../">← Home</a>
   </header>
   <main>
@@ -150,21 +150,68 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
         masterGain = audioCtx.createGain();
         masterGain.gain.value = 0.9;
         masterGain.connect(audioCtx.destination);
+        audioCtx.onstatechange = () => {
+          // iOS: 'interrupted' (call, Siri, other app took audio, long idle)
+          // or 'closed' by the system. Stop cleanly so the UI stays usable.
+          if (audioDead() && state === 'playing') pause();
+        };
       }
       return audioCtx;
+    }
+
+    // A context the system has closed or interrupted can't be revived
+    // reliably on iOS, so it is replaced. Decoded piano samples are plain
+    // AudioBuffers and work in the new context, so nothing is re-downloaded.
+    function audioDead() {
+      return !audioCtx || audioCtx.state === 'closed' || audioCtx.state === 'interrupted';
+    }
+
+    function resetAudio() {
+      for (const n of activeNodes) { try { n.stop(); n.disconnect(); } catch (e) {} }
+      activeNodes = [];
+      if (audioCtx) {
+        audioCtx.onstatechange = null;
+        if (audioCtx.state !== 'closed') audioCtx.close().catch(() => {});
+      }
+      audioCtx = null;
+      masterGain = null;
     }
 
     // Browsers only let audio start inside a user gesture. Unlock on every
     // gesture type until it works (on phones, a touch "pointerdown" alone
     // does not count, so touchend/click are needed too).
     function unlockAudio() {
+      if (audioDead()) resetAudio();
       const ctx = getAudioCtx();
-      if (ctx.state !== 'running') ctx.resume();
+      if (ctx.state !== 'running') ctx.resume().catch(() => {});
       if (silentAudio && state === 'playing' && silentAudio.paused) silentAudio.play().catch(() => {});
     }
     for (const ev of ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown']) {
       window.addEventListener(ev, unlockAudio, { capture: true, passive: true });
     }
+
+    // ---------- Sleep / wake ----------
+    // When the tab goes to the background (app switch, screen lock), pause:
+    // iOS stops the audio anyway. When it comes back after a while, start
+    // with a fresh audio context (iOS often leaves the old one silently
+    // broken), ready for the next tap on Play.
+    let hiddenAt = 0;
+    function onHide() {
+      if (!hiddenAt) hiddenAt = performance.now();
+      if (state === 'playing') pause();
+      if (silentAudio) silentAudio.pause();
+    }
+    function onWake() {
+      const away = hiddenAt ? performance.now() - hiddenAt : 0;
+      hiddenAt = 0;
+      if (audioCtx && (audioDead() || away > 30000)) {
+        resetAudio();
+        getAudioCtx();  // created suspended; the next tap resumes it
+      }
+    }
+    document.addEventListener('visibilitychange', () => document.hidden ? onHide() : onWake());
+    window.addEventListener('pagehide', onHide);
+    window.addEventListener('pageshow', e => { if (e.persisted) hiddenAt = hiddenAt || 1; onWake(); });
 
     // ---------- Rendering ----------
     function render() {
@@ -388,6 +435,8 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
     //  2. Then: average the error and, if it exceeds 6 ms, glide the
     //     marker back in sync by at most 0.5 ms per frame (invisible).
     let perfAtStart = 0;
+    let lastCtxTime = -1;
+    let stuckSince = 0;
     let lockSamples = [];
     let errAvg = 0;
 
@@ -410,6 +459,21 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
     }
 
     function tick(now) {
+      // Watchdog: audio that never starts, or whose clock stopped moving
+      // (iOS can leave a "running" context frozen after a long idle).
+      // Give up after 1.5 s, replace the audio, and let the next tap play.
+      const ctxNow = audioCtx.currentTime;
+      if (ctxNow !== lastCtxTime) {
+        lastCtxTime = ctxNow;
+        stuckSince = 0;
+      } else if (!stuckSince) {
+        stuckSince = now;
+      } else if (now - stuckSince > 1500) {
+        pause();
+        resetAudio();
+        statusEl.textContent = 'Audio was asleep — tap Play again';
+        return;
+      }
       if (audioCtx.state !== 'running') {
         // Audio not started yet (phone waiting for the finger to lift):
         // hold the marker on the start position until sound begins.
@@ -496,20 +560,32 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
     }
 
     // ---------- Transport ----------
-    function play() {
-      if (!tk || state === 'playing') return;
+    function startAudio() {
       unlockAudio();
-      if (offset >= totalDuration) offset = 0;
       // Start almost immediately; a tiny lead keeps the first attack click-free.
       ctxStartTime = audioCtx.currentTime + 0.01;
       perfAtStart = measureAnchor();
       lockSamples = [];
       errAvg = 0;
+      stuckSince = 0;
       for (const n of notes) {
         if (n.end <= offset) continue;
         const start = Math.max(n.start, offset);
         // Resuming in the middle of a note: start the sample part-way through.
         scheduleNote(n.pitch, ctxStartTime + (start - offset), n.end - start, start - n.start);
+      }
+    }
+
+    function play() {
+      if (!tk || state === 'playing') return;
+      if (offset >= totalDuration) offset = 0;
+      try {
+        startAudio();
+      } catch (err) {
+        // The audio context broke while idle: replace it and try once more.
+        console.warn('Audio restart', err);
+        resetAudio();
+        startAudio();
       }
       state = 'playing';
       if (silentAudio) silentAudio.play().catch(() => {});
