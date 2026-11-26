@@ -108,17 +108,57 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
     let rafId = null;
     let endTimer = null;
 
-    // Create/resume the AudioContext on the very first user interaction so
-    // that it is already running when Play is clicked (minimal start latency).
-    function ensureAudio() {
+    let masterGain = null;
+
+    // Play through the phone's silent/ring switch (iOS) while still following
+    // the hardware volume: the "playback" audio session is what music apps use.
+    if (navigator.audioSession) {
+      try { navigator.audioSession.type = 'playback'; } catch (e) {}
+    }
+
+    // Older iOS (< 17) has no audioSession API. Playing an <audio> element
+    // switches the page into the same "playback" category, so we loop a
+    // tiny silent clip while the music is playing.
+    const silentAudio = (() => {
+      if (navigator.audioSession) return null;
+      const rate = 8000, len = rate / 2;
+      const buf = new ArrayBuffer(44 + len);
+      const v = new DataView(buf);
+      const w = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+      w(0, 'RIFF'); v.setUint32(4, 36 + len, true); w(8, 'WAVE'); w(12, 'fmt ');
+      v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+      v.setUint32(24, rate, true); v.setUint32(28, rate, true); v.setUint16(32, 1, true);
+      v.setUint16(34, 8, true); w(36, 'data'); v.setUint32(40, len, true);
+      for (let i = 0; i < len; i++) v.setUint8(44 + i, 128);
+      const a = new Audio(URL.createObjectURL(new Blob([buf], { type: 'audio/wav' })));
+      a.loop = true;
+      a.setAttribute('playsinline', '');
+      return a;
+    })();
+
+    // The AudioContext is created right away (suspended) so the piano samples
+    // can be downloaded and decoded before the user ever presses Play.
+    function getAudioCtx() {
       if (!audioCtx) {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+        masterGain = audioCtx.createGain();
+        masterGain.gain.value = 0.9;
+        masterGain.connect(audioCtx.destination);
       }
-      if (audioCtx.state === 'suspended') audioCtx.resume();
       return audioCtx;
     }
-    window.addEventListener('pointerdown', ensureAudio, { once: true, capture: true });
-    window.addEventListener('keydown', ensureAudio, { once: true, capture: true });
+
+    // Browsers only let audio start inside a user gesture. Unlock on every
+    // gesture type until it works (on phones, a touch "pointerdown" alone
+    // does not count, so touchend/click are needed too).
+    function unlockAudio() {
+      const ctx = getAudioCtx();
+      if (ctx.state !== 'running') ctx.resume();
+      if (silentAudio && state === 'playing' && silentAudio.paused) silentAudio.play().catch(() => {});
+    }
+    for (const ev of ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown']) {
+      window.addEventListener(ev, unlockAudio, { capture: true, passive: true });
+    }
 
     // ---------- Rendering ----------
     function render() {
@@ -224,7 +264,7 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
         const r = cursorEl.getBoundingClientRect();
         const headerH = document.querySelector('header').offsetHeight;
         if (r.top < headerH || r.bottom > window.innerHeight) {
-          window.scrollBy({ top: r.top - headerH - 40, behavior: 'smooth' });
+          window.scrollBy(0, r.top - headerH - 40);  // jump, no animation
         }
       }
     }
@@ -255,53 +295,75 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       rafId = requestAnimationFrame(tick);
     }
 
-    // ---------- Synth (Web Audio, no samples to download → instant start) ----------
-    function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+    // ---------- Piano (Salamander Grand Piano samples) ----------
+    // One sample every 3 semitones from A0 (21) to C8 (108); other notes are
+    // pitch-shifted from the nearest sample. Only the samples the score needs
+    // are downloaded, and they are decoded before Play is pressed.
+    const NOTE_NAMES = ['C', 'Cs', 'D', 'Ds', 'E', 'F', 'Fs', 'G', 'Gs', 'A', 'As', 'B'];
+    const samples = {};        // sample midi -> Promise<AudioBuffer>
+    const sampleBuffers = {};  // sample midi -> AudioBuffer (once decoded)
 
-    function scheduleNote(freq, when, dur) {
-      const osc = audioCtx.createOscillator();
-      const osc2 = audioCtx.createOscillator();
+    function sampleFor(midi) {
+      const m = Math.min(108, Math.max(21, midi));
+      return 21 + Math.round((m - 21) / 3) * 3;
+    }
+
+    function loadSample(sm) {
+      if (!samples[sm]) {
+        const name = NOTE_NAMES[sm % 12] + (Math.floor(sm / 12) - 1);
+        samples[sm] = fetch(`piano/${name}.mp3`)
+          .then(r => r.arrayBuffer())
+          .then(data => new Promise((ok, fail) => getAudioCtx().decodeAudioData(data, ok, fail)))
+          .then(buf => (sampleBuffers[sm] = buf));
+      }
+      return samples[sm];
+    }
+
+    function loadSamplesForScore() {
+      const needed = new Set(notes.map(n => sampleFor(n.pitch)));
+      return Promise.all([...needed].map(loadSample));
+    }
+
+    function scheduleNote(midi, when, dur, skip = 0) {
+      const sm = sampleFor(midi);
+      const buf = sampleBuffers[sm];
+      if (!buf) return;
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.playbackRate.value = Math.pow(2, (midi - sm) / 12);
       const gain = audioCtx.createGain();
-      osc.type = 'triangle';
-      osc2.type = 'sine';
-      osc.frequency.value = freq;
-      osc2.frequency.value = freq * 2;
-      const g2 = audioCtx.createGain();
-      g2.gain.value = 0.25;
-      osc.connect(gain);
-      osc2.connect(g2).connect(gain);
-      gain.connect(audioCtx.destination);
-      const peak = 0.3;
-      const release = 0.08;
-      const noteEnd = when + Math.max(0.05, dur - 0.02);
-      gain.gain.setValueAtTime(0, when);
-      gain.gain.linearRampToValueAtTime(peak, when + 0.008);
-      gain.gain.exponentialRampToValueAtTime(peak * 0.5, when + Math.min(0.3, dur));
-      gain.gain.setValueAtTime(peak * 0.5, noteEnd);
-      gain.gain.linearRampToValueAtTime(0, noteEnd + release);
-      osc.start(when); osc2.start(when);
-      osc.stop(noteEnd + release + 0.01); osc2.stop(noteEnd + release + 0.01);
-      activeNodes.push(osc, osc2);
+      src.connect(gain).connect(masterGain);
+      const noteEnd = when + Math.max(0.05, dur);
+      const release = 0.12;
+      gain.gain.setValueAtTime(1, when);
+      gain.gain.setValueAtTime(1, noteEnd);
+      gain.gain.setTargetAtTime(0, noteEnd, release / 3);   // key released: damper
+      src.start(when, Math.min(skip * src.playbackRate.value, buf.duration - 0.01));
+      src.stop(noteEnd + release + 0.05);
+      activeNodes.push(src);
     }
 
     function stopAllNodes() {
       for (const n of activeNodes) { try { n.stop(); n.disconnect(); } catch (e) {} }
       activeNodes = [];
+      if (silentAudio) silentAudio.pause();
     }
 
     // ---------- Transport ----------
     function play() {
       if (!tk || state === 'playing') return;
-      ensureAudio();
+      unlockAudio();
       if (offset >= totalDuration) offset = 0;
       // Start almost immediately; a tiny lead keeps the first attack click-free.
       ctxStartTime = audioCtx.currentTime + 0.01;
       for (const n of notes) {
         if (n.end <= offset) continue;
         const start = Math.max(n.start, offset);
-        scheduleNote(midiToFreq(n.pitch), ctxStartTime + (start - offset), n.end - start);
+        // Resuming in the middle of a note: start the sample part-way through.
+        scheduleNote(n.pitch, ctxStartTime + (start - offset), n.end - start, start - n.start);
       }
       state = 'playing';
+      if (silentAudio) silentAudio.play().catch(() => {});
       clearTimeout(endTimer);
       endTimer = setTimeout(stop, (totalDuration - offset) * 1000 + 150);
       cancelAnimationFrame(rafId);
@@ -366,9 +428,15 @@ F F G A|A G F E|D D E F|E3/2 D/ D2|]`;
       render();
       buildTiming();
       computeOnsetPositions();
-      btnPlayStop.disabled = false;
-      btnPlayPause.disabled = false;
-      updateButtons();
+      statusEl.textContent = 'Loading piano…';
+      loadSamplesForScore().then(() => {
+        btnPlayStop.disabled = false;
+        btnPlayPause.disabled = false;
+        updateButtons();
+      }).catch(err => {
+        statusEl.textContent = 'Could not load piano sounds';
+        console.error(err);
+      });
     }
   </script>
   <script src="https://cdn.jsdelivr.net/npm/verovio@6.3.0/dist/verovio-toolkit-wasm.js"></script>
